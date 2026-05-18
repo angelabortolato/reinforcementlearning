@@ -1,5 +1,5 @@
-import keras.api._v2.keras as K
 import tensorflow as tf
+import tensorflow.keras as K
 import numpy as np
 
 
