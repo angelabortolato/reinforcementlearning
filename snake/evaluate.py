@@ -5,8 +5,9 @@ from matplotlib import animation
 from IPython.display import HTML
 
 
-def evaluate_and_animate_policy(env, policy_fn, policy_name="Baseline", max_steps=100, gamma=0.9):
-    
+def evaluate_and_animate_policy(env, policy_fn, policy_name="Baseline", max_steps=100, 
+    gamma=0.9):
+
     # Store history matrix array steps ONLY for board index 0 to save memory
     history_boards = [env.boards[0].copy()]
     

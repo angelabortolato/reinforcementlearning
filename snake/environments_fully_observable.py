@@ -26,6 +26,7 @@ class BaseEnvironment:
         self.board_size = board_size
         self.n_boards = n_boards
 
+
         # create the actual boards (empty, subclasses will fill them with the required stuff)
         self.boards = np.ones((self.n_boards, self.board_size, self.board_size)) * self.EMPTY
         # store the bodies of the snakes
