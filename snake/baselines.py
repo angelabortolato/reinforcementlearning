@@ -83,3 +83,51 @@ def zigzag_policy(env):
                     actions.append(env.LEFT) # Reached the sub-top, step left
                     
     return np.array(actions, dtype=int)
+
+def semi_blind_policy(env):
+    """
+    Semi-Blind Policy: Scans the local mask view returned by env.to_state().
+    If the fruit is visible locally, moves greedily towards it.
+    Otherwise, explores randomly.
+    """
+    # 1. Get the current partial observations layer
+    # Shape: (n_boards, local_size, local_size, 4) where channel mapping is [EMPTY, FRUIT, BODY, HEAD]
+    # (Note: environmental channels are shifted by 1 due to to_categorical slice optimization)
+    states = env.to_state() 
+    n_boards = env.n_boards
+    
+    actions = np.zeros(n_boards, dtype=int)
+    
+    # Identify the exact dimensions of our localized vision matrix (e.g., 5x5)
+    local_size = states.shape[1]
+    center_idx = local_size // 2 # The snake's head is always at the absolute center
+    
+    # Channel 1 corresponds to the FRUIT categorical representation layer
+    fruit_channel = states[..., 1] 
+    
+    for b in range(n_boards):
+        # Scan the local fruit map channel for this specific board
+        fruit_positions = np.argwhere(fruit_channel[b] == 1)
+        
+        if len(fruit_positions) > 0:
+            # Fruit is visible! Grab its local coordinate location
+            fx, fy = fruit_positions[0]
+            
+            # Calculate the directional offset relative to the head at the center
+            # fx > center_idx means fruit is below/above depending on indexing structure
+            if fx > center_idx:
+                actions[b] = env.UP
+            elif fx < center_idx:
+                actions[b] = env.DOWN
+            elif fy > center_idx:
+                actions[b] = env.RIGHT
+            elif fy < center_idx:
+                actions[b] = env.LEFT
+            else:
+                actions[b] = np.random.choice(4) # Fallback redundancy
+        else:
+            # Fruit is outside the vision mask radius. Revert to random exploration.
+            actions[b] = np.random.choice(4)
+            
+    return actions
+

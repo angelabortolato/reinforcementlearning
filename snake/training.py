@@ -1,11 +1,35 @@
 import numpy as np
+import pandas as pd
 import tensorflow as tf
 import tensorflow.keras as K
 import random
 from collections import deque
 import environments_fully_observable 
+import environments_partially_observable 
+from evaluate import run_evaluation
 import os
 
+def get_env(config, n=None, full=True):
+    """
+    Standardized environment instantiation function.
+    If 'n' is explicitly provided, it overrides the default batch size 
+    (useful for switching between training and high-volume baseline evaluations).
+    """
+    # Fallback to evaluation batch size if not explicitly defined
+    num_boards = n if n is not None else config["N_BOARDS_EVAL"]
+    size = config["BOARD_SIZE"]
+
+    if full:
+        e = environments_fully_observable.OriginalSnakeEnvironment(num_boards, size)
+    else:
+        mask = config["MASK SIZE"]
+        e=environments_partially_observable.OriginalSnakeEnvironment(num_boards, size, mask)
+        
+    return e
+
+# ------------------------------------------------------------------------------------------
+#                                         DQN
+# ------------------------------------------------------------------------------------------
 
 class VectorizedReplayBuffer:
     """Efficient cyclic buffer for multi-board batch state storage."""
@@ -41,48 +65,114 @@ class VectorizedReplayBuffer:
             tf.convert_to_tensor(self.rewards[indices]),
             tf.convert_to_tensor(self.next_states[indices])
         )
-
-
+    
 def build_q_network(input_shape, action_space=4):
-    """Creates the deep Q-network model processing the one-hot encoded state tensor."""
+    """Optimal CNN architecture for small spatial grid worlds."""
     model = K.Sequential([
-        K.layers.Input(shape=input_shape),
-        # Since the grid is fully observable and small (e.g. 8x8), a dense network 
-        # or flat convolutional processing learns the localized intersections well
+        K.layers.Input(shape=input_shape), # Shape: (8, 8, 4)
+        
+        # 1. Spatial Feature Extraction (No Pooling!)
+        K.layers.Conv2D(
+            filters=32, 
+            kernel_size=(3, 3), 
+            padding='same', 
+            activation='relu',
+            kernel_initializer=K.initializers.HeUniform()
+        ),
+        K.layers.Conv2D(
+            filters=64, 
+            kernel_size=(3, 3), 
+            padding='same', 
+            activation='relu',
+            kernel_initializer=K.initializers.HeUniform()
+        ),
+        
+        # 2. Flatten spatial maps to transition into strategic reasoning
         K.layers.Flatten(),
-        K.layers.Dense(128, activation='relu'),
-        K.layers.Dense(64, activation='relu'),
-        K.layers.Dense(action_space, activation='linear') # Outputs raw Q-values
+        
+        # 3. Decision Dense Layer
+        K.layers.Dense(
+            64, 
+            activation='relu', 
+            kernel_initializer=K.initializers.HeUniform()
+        ),
+        
+        # 4. Output Layer
+        K.layers.Dense(
+            action_space, 
+            activation='linear',
+            kernel_initializer=K.initializers.TruncatedNormal(mean=0.0, stddev=0.01),
+            bias_initializer=K.initializers.Zeros()
+        )
     ])
     return model
 
+def dqn_policy(env, q_network):
+    states = env.to_state()
+    q_values = q_network(states, training=False).numpy()
+    return np.argmax(q_values, axis=1)
 
-def train_dqn(config):
+def train_dqn(config, full=True):
     # 1. Initialize environment properties dynamically using the configuration mapping
-    env_t = environments_fully_observable.OriginalSnakeEnvironment(
-        n_boards=config["N_BOARDS_TRAIN"], 
-        board_size=config["BOARD_SIZE"]
+    env_t = get_env(config, n=config["N_BOARDS_TRAIN"], full=full
     )
-    
-    # Dynamically extract network input shape from one-hot state output layers
+    gamma = config["GAMMA"]
+    eval_freq = config["EVAL_FREQ"]
+    tau= config["TAU"]
+
+    # Dynamically extract network input shape
     state_sample = env_t.to_state()
-    state_shape = state_sample.shape[1:]  # Automatically computes (BOARD_SIZE, BOARD_SIZE, 4)
+    state_shape = state_sample.shape[1:]  
     
-    # 2. Instantiate Q-Networks and Memory
+    # Instantiate Q-Networks and Memory
     q_network = build_q_network(state_shape)
     target_network = build_q_network(state_shape)
     target_network.set_weights(q_network.get_weights())
     
-    optimizer = K.optimizers.Adam(learning_rate=config["LEARNING_RATE"])
+    optimizer = tf.keras.optimizers.Adam(learning_rate=config["LEARNING_RATE"])
     buffer = VectorizedReplayBuffer(capacity=config["BUFFER_CAPACITY"], state_shape=state_shape)
     
     epsilon = config["EPSILON_START"]
     states = env_t.to_state() 
     
-    print(f"Beginning DQN Training on {config['N_BOARDS_TRAIN']} boards of size {config['BOARD_SIZE']}x{config['BOARD_SIZE']}...")
+    # Metrics history dictionary
+    eval_history = {
+        "step": [], 
+        "avg_wins":[],
+        "avg_fruits": [], 
+        "avg_wall_hits": [], 
+        "avg_self_bites": [], 
+        "avg_raw_reward": [],
+        "avg_discounted_return": []  
+    }
     
-    for step in range(config["MAX_STEPS"]):
-        # --- EXPLORATION VS EXPLOITATION: epsilon greedy ---
+    print(f"Beginning DQN Training with embedded evaluation intervals every {eval_freq} steps...")
+    
+    for step in range(config["TRAINING_STEPS"]):
+        
+        # --- PERIODIC EVALUATION CYCLE ---
+        if step % eval_freq == 0:
+            env_eval = get_env(config, 
+                n=config["N_BOARDS_EVAL"], 
+                full=full
+            )
+            dqn_policy_fn = lambda e: dqn_policy(e, q_network)
+            
+            # Extract independent evaluation values (including return calculations)
+            metrics = run_evaluation(env_eval, dqn_policy_fn, max_steps=100, gamma=gamma)
+            
+            eval_history["step"].append(step)
+            eval_history["avg_wins"].append(metrics["avg_wins"])
+            eval_history["avg_fruits"].append(metrics["avg_fruits"])
+            eval_history["avg_wall_hits"].append(metrics["avg_wall_hits"])
+            eval_history["avg_self_bites"].append(metrics["avg_self_bites"])
+            eval_history["avg_raw_reward"].append(metrics["avg_raw_reward"])
+            eval_history["avg_discounted_return"].append(metrics["avg_discounted_return"])
+            
+            print(f"[EVAL @ STEP {step:5d}, espilon {epsilon:.3f}] Return (G0): {metrics['avg_discounted_return']:.4f} | "
+                  f"Wins: {metrics['avg_wins']:.2f} | Fruits: {metrics['avg_fruits']:.2f} | Wall Hits: {metrics['avg_wall_hits']:.1f} | Bites: {metrics['avg_self_bites']:.1f}")
+
+        # --- STANDARD TRAINING STEP LOOP ---
         if random.random() < epsilon:
             actions = np.random.choice(4, size=config["N_BOARDS_TRAIN"])
         else:
@@ -97,189 +187,320 @@ def train_dqn(config):
         buffer.push_batch(states, actions, rewards, next_states)
         states = next_states 
         
-        # --- LEARNING / OPTIMIZATION BACKPROPAGATION ---
         if buffer.size > config["BATCH_SIZE"]:
             b_states, b_actions, b_rewards, b_next_states = buffer.sample(batch_size=config["BATCH_SIZE"])
-            
             next_q_values = target_network(b_next_states, training=False)
             max_next_q = tf.reduce_max(next_q_values, axis=1)
-            
-            # Use global gamma parameter configuration safely
-            target_q_targets = b_rewards + (config["GAMMA"] * max_next_q)
+            target_q_targets = b_rewards + (gamma * max_next_q)
             
             with tf.GradientTape() as tape:
                 current_q_values = q_network(b_states, training=True)
                 one_hot_actions = tf.one_hot(b_actions, depth=4)
                 chosen_q_values = tf.reduce_sum(current_q_values * one_hot_actions, axis=1)
-                loss = tf.reduce_mean(tf.square(target_q_targets - chosen_q_values))
+                huber = tf.keras.losses.Huber()
+                loss = huber(target_q_targets, chosen_q_values)
                 
             grads = tape.gradient(loss, q_network.trainable_variables)
             optimizer.apply_gradients(zip(grads, q_network.trainable_variables))
             
-        # Decay exploration factor over time
         epsilon = max(config["EPSILON_END"], epsilon * config["EPSILON_DECAY"])
         
-        # Synchronize target network periodically
-        if step % config["TARGET_UPDATE_FREQ"] == 0:
-            target_network.set_weights(q_network.get_weights())
-            
-        if step % 1000 == 0:
-            print(f"Step: {step:5d} | Epsilon: {epsilon:.3f} | Buffer Size: {buffer.size:5d}")
+        # Continuous target updates (Polyak Averaging)
+        online_weights = q_network.get_weights()
+        target_weights = target_network.get_weights()
+        new_weights = [tau * o + (1-tau) * t for o, t in zip(online_weights, target_weights)]
+        target_network.set_weights(new_weights)
             
     print("Training finished! Saving model...")
     os.makedirs("models", exist_ok=True)
-    q_network.save("models/dqn_snake.keras")
+    if full:
+        q_network.save("models/dqn_snake.keras")
+    else:
+        q_network.save("models/dqn_snake_partial.keras")
+    
+    return pd.DataFrame(eval_history)
 
+
+# ------------------------------------------------------------------------------------------
+#                                         PPO
+# ------------------------------------------------------------------------------------------
 
 def build_ppo_networks(input_shape, action_space=4):
     """
-    Creates the dual models required for PPO:
-    1. The Actor (Policy Network) outputs categorical probability distributions.
-    2. The Critic (Value Network) outputs a scalar baseline state value evaluation V(s).
+    Creates the dual models required for PPO using separate CNN backbones.
     """
     actor = K.Sequential([
         K.layers.Input(shape=input_shape),
+        K.layers.Conv2D(
+            filters=32, kernel_size=(3, 3), padding='same', activation='relu',
+            kernel_initializer=K.initializers.HeUniform()
+        ),
+        K.layers.Conv2D(
+            filters=64, kernel_size=(3, 3), padding='same', activation='relu',
+            kernel_initializer=K.initializers.HeUniform()
+        ),
         K.layers.Flatten(),
-        K.layers.Dense(128, activation='relu'),
-        K.layers.Dense(64, activation='relu'),
-        K.layers.Dense(action_space, activation='softmax') # Guarantees valid probability distribution
+        K.layers.Dense(64, activation='relu', kernel_initializer=K.initializers.HeUniform()),
+        
+        # Safe initialization for uniform early exploration
+        K.layers.Dense(
+            action_space, 
+            activation='softmax',
+            kernel_initializer=K.initializers.TruncatedNormal(stddev=0.01),
+            bias_initializer=K.initializers.Zeros()
+        ) 
     ])
     
     critic = K.Sequential([
         K.layers.Input(shape=input_shape),
+        K.layers.Conv2D(
+            filters=32, kernel_size=(3, 3), padding='same', activation='relu',
+            kernel_initializer=K.initializers.HeUniform()
+        ),
+        K.layers.Conv2D(
+            filters=64, kernel_size=(3, 3), padding='same', activation='relu',
+            kernel_initializer=K.initializers.HeUniform()
+        ),
         K.layers.Flatten(),
-        K.layers.Dense(128, activation='relu'),
-        K.layers.Dense(64, activation='relu'),
-        K.layers.Dense(1, activation='linear')    # Outputs continuous expected future returns
+        K.layers.Dense(64, activation='relu', kernel_initializer=K.initializers.HeUniform()),
+        
+        # Safe initialization for baseline evaluation values starting near 0
+        K.layers.Dense(
+            1, 
+            activation='linear',
+            kernel_initializer=K.initializers.TruncatedNormal(stddev=0.01),
+            bias_initializer=K.initializers.Zeros()
+        )    
     ])
-    
     return actor, critic
 
-def train_ppo(config):
+def ppo_policy(env, ppo_actor):
+    states = env.to_state()
+    # PPO returns probabilistic matrices array profiles
+    probabilities = ppo_actor(states, training=False).numpy()
+    # Select the highest probability index as the optimal action choice
+    return np.argmax(probabilities, axis=1)
+
+def sample_categorical_actions(action_probs):
+    """
+    Samples one discrete action per parallel board using its probability distribution.
+    Guarantees choices remain strictly inside valid bounds [0, 1, 2, 3].
+    """
+    cdf = np.cumsum(action_probs, axis=1)
+    r = np.random.rand(action_probs.shape[0], 1)
+    
+    # Calculate raw sum
+    actions = np.sum(cdf < r, axis=1)
+    
+    # Clip to maximum valid action index (3) to prevent out-of-bound rounding errors
+    return np.clip(actions, 0, action_probs.shape[1] - 1)
+
+
+def compute_log_probabilities(action_probs, actions):
+    """
+    Extracts the log probability of the specifically chosen actions using NumPy.
+    """
+    n_boards = action_probs.shape[0]
+    # Advanced indexing to pull the exact probability of the action chosen on each board
+    chosen_probs = action_probs[np.arange(n_boards), actions]
+    # Add a tiny epsilon (1e-8) to prevent taking the log of absolute 0
+    return np.log(chosen_probs + 1e-8)
+
+def compute_gae_targets(rollout_rewards, rollout_values, last_values, gamma=0.9, lmbda=0.95):
+    """
+    Computes generalized advantage estimations (GAE) and discounted returns-to-go targets.
+    
+    Inputs are lists of length ROLLOUT_STEPS containing arrays of shape (N_BOARDS,)
+    """
+    rollout_steps = len(rollout_rewards)
+    n_boards = rollout_rewards[0].shape[0]
+    
+    # Convert lists to 2D matrices of shape (ROLLOUT_STEPS, N_BOARDS)
+    rewards = np.array(rollout_rewards)
+    values = np.array(rollout_values)
+    
+    advantages = np.zeros((rollout_steps, n_boards))
+    last_gae_lam = 0
+    
+    # Append the next-state value estimation to make calculating differences easy
+    # Shape becomes (ROLLOUT_STEPS + 1, N_BOARDS)
+    values_extended = np.vstack([values, last_values[None, :]])
+    
+    # Loop BACKWARDS from the future to the present to chain temporal dependencies
+    for t in reversed(range(rollout_steps)):
+        # TD Error (delta) = Reward + gamma * V(s_next) - V(s_current)
+        delta = rewards[t] + gamma * values_extended[t+1] - values_extended[t]
+        
+        # GAE recursive chain formulation
+        advantages[t] = last_gae_lam = delta + gamma * lmbda * last_gae_lam
+        
+    # Target Returns-To-Go = Advantages + Critic Baseline Predictions
+    discounted_returns = advantages + values
+    
+    return discounted_returns, advantages
+
+def flatten_rollout(rollout_list):
+    """
+    Converts a list of length ROLLOUT_STEPS containing arrays of shape (N_BOARDS, ...)
+    into a single unified array of shape (ROLLOUT_STEPS * N_BOARDS, ...)
+    """
+    arr = np.array(rollout_list)
+    # Merges axes 0 and 1 together
+    return arr.reshape(-1, *arr.shape[2:])
+
+def compute_tf_log_probabilities(action_probs, actions):
+    """
+    Extracts the log probability of the chosen actions using TensorFlow operations.
+    Input shapes: action_probs (BATCH_SIZE, 4), actions (BATCH_SIZE,)
+    """
+    batch_size = tf.shape(action_probs)[0]
+    
+    # Create rows indices: [0, 1, 2, ..., BATCH_SIZE-1]
+    row_indices = tf.range(batch_size, dtype=tf.int32)
+    
+    # Stack row indices with action choices to create coordinates: [[0, action_0], [1, action_1], ...]
+    gather_indices = tf.stack([row_indices, tf.cast(actions, tf.int32)], axis=1)
+    
+    # Extract the exact probabilities matching those coordinates
+    chosen_probs = tf.gather_nd(action_probs, gather_indices)
+    
+    return tf.math.log(chosen_probs + 1e-8)
+
+def train_ppo(config, full=True):
     # 1. Initialize vectorized environment
-    env_t = environments_fully_observable.OriginalSnakeEnvironment(
-        n_boards=config["N_BOARDS_TRAIN"], 
-        board_size=config["BOARD_SIZE"]
+    env_t = get_env(config,
+        n=config["N_BOARDS_TRAIN"], 
+        full=full
     )
     
     state_sample = env_t.to_state()
-    state_shape = state_sample.shape[1:] # (BOARD_SIZE, BOARD_SIZE, 4)
+    state_shape = state_sample.shape[1:] 
     
     # 2. Instantiate networks and optimizers
     actor, critic = build_ppo_networks(state_shape, action_space=4)
     actor_optimizer = K.optimizers.Adam(learning_rate=config["LEARNING_RATE"])
     critic_optimizer = K.optimizers.Adam(learning_rate=config["LEARNING_RATE"])
     
-    # Extract hyperparameter targets from global configuration mappings
-    ROLLOUT_STEPS = config.get("ROLLOUT_STEPS", 20) # Steps collected per board per rollout phase
-    PPO_EPOCHS = config.get("PPO_EPOCHS", 4)        # Gradient evaluation loops over rollout batches
-    CLIP_VAL = config.get("CLIP_EPSILON", 0.2)      # PPO clip parameter bounds
-    GAMMA = config["GAMMA"]
+    eval_freq = config["EVAL_FREQ"]
+    total_optimization_targets = config["TRAINING_STEPS"]
+    eval_history = {
+        "step": [], "avg_fruits": [], "avg_wall_hits": [], 
+        "avg_self_bites": [], "avg_wins": [], "avg_raw_reward": [], "avg_discounted_return": []
+    }
     
-    states = env_t.to_state()
-    print(f"Beginning Vectorized PPO Training on {config['N_BOARDS_TRAIN']} parallel boards...")
+    # Initialize the parallel states
+    states = env_t.to_state() # Shape: (N_BOARDS_TRAIN, 8, 8, 4)
     
-    # Calculate training iterations based on your target step capacity limits
-    iterations = config["MAX_STEPS"] // ROLLOUT_STEPS
+    # Track the total environment steps taken across all boards
+    optimization_step = 0
+    print(f"Beginning PPO Training for exactly {total_optimization_targets} optimization updates...")
     
-    for itr in range(iterations):
-        # Memory storage lists for on-policy batch trajectory accumulation
-        b_states, b_actions, b_rewards, b_old_log_probs, b_values = [], [], [], [], []
+    # Outer loop runs for your total training allocation timeline
+    while optimization_step < total_optimization_targets:
         
-        # --- 1. TRAJECTORY ROLLOUT PHASE (Data Gathering) ---
-        for _ in range(ROLLOUT_STEPS):
-            # Compute action probability distributions using current actor weights
-            probs = actor(states, training=False)
+# --- PERIODIC EVALUATION CYCLE ---
+        if optimization_step % 480 == 0:
+            env_eval = get_env(config, 
+                n=config["N_BOARDS_EVAL"], full=full
+            )
+            ppo_policy_fn = lambda e: np.argmax(actor(e.to_state(), training=False).numpy(), axis=1)
+            metrics = run_evaluation(env_eval, ppo_policy_fn, max_steps=100, gamma=config["GAMMA"])
             
-            # Use log-probability categorical transformations for sample collection step selection
-            logits = tf.math.log(probs + 1e-10)
-            actions = tf.random.categorical(logits, num_samples=1)[:, 0].numpy()
+            # CRITICAL FIX: Append to EVERY single list in the dictionary simultaneously
+            eval_history["step"].append(optimization_step)
+            eval_history["avg_fruits"].append(metrics["avg_fruits"])
+            eval_history["avg_wall_hits"].append(metrics["avg_wall_hits"])
+            eval_history["avg_self_bites"].append(metrics["avg_self_bites"])
+            eval_history["avg_wins"].append(metrics["avg_wins"])
+            eval_history["avg_raw_reward"].append(metrics["avg_raw_reward"])
+            eval_history["avg_discounted_return"].append(metrics["avg_discounted_return"])
             
-            # Extract log-probabilities corresponding strictly to chosen actions
-            one_hot = tf.one_hot(actions, depth=4)
-            old_log_probs = tf.math.log(tf.reduce_sum(probs * one_hot, axis=1) + 1e-10).numpy()
+            print(f"[EVAL @ UPDATE {optimization_step:5d}] Return (G0): {metrics['avg_discounted_return']:.4f} | "
+                  f"Fruits: {metrics['avg_fruits']:.2f} | Wall/Bite: {metrics['avg_wall_hits']:.1f}/{metrics['avg_self_bites']:.1f}")
+        # --- 1. DATA COLLECTION (ON-POLICY ROLLOUTS) ---
+        rollout_states, rollout_actions, rollout_rewards, rollout_log_probs, rollout_values = [], [], [], [], []
+        
+        for t in range(config["ROLLOUT_STEPS"]):
+            action_probs = actor(states, training=False).numpy()
+            state_values = critic(states, training=False).numpy()
             
-            # Fetch critic baseline expectations
-            values = critic(states, training=False).numpy()[:, 0]
+            actions = sample_categorical_actions(action_probs)
+            log_probs = compute_log_probabilities(action_probs, actions)
             
-            # Step the vectorized environment forward
-            actions_input = actions[:, None] if actions.ndim == 1 else actions
-            rewards_tensor = env_t.move(actions_input)
+            rewards_tensor = env_t.move(actions[:, None].copy()) 
             rewards = rewards_tensor.numpy()[:, 0]
             
-            # Log trajectories
-            b_states.append(states)
-            b_actions.append(actions)
-            b_rewards.append(rewards)
-            b_old_log_probs.append(old_log_probs)
-            b_values.append(values)
+            rollout_states.append(states)
+            rollout_actions.append(actions)
+            rollout_rewards.append(rewards)
+            rollout_log_probs.append(log_probs)
+            rollout_values.append(state_values[:, 0])
             
-            # Progress tracking pointers update
             states = env_t.to_state()
             
-        # Convert lists to high-speed numpy matrix arrays for calculation handling
-        b_states = np.array(b_states).reshape(-1, *state_shape)
-        b_actions = np.array(b_actions).flatten()
-        b_rewards = np.array(b_rewards).reshape(ROLLOUT_STEPS, -1)
-        b_old_log_probs = np.array(b_old_log_probs).flatten()
-        b_values = np.array(b_values).reshape(ROLLOUT_STEPS, -1)
+        last_values = critic(states, training=False).numpy()[:, 0]
         
-        # Calculate terminal boot-strap state values evaluation
-        next_values = critic(states, training=False).numpy()[:, 0]
+        # --- 2. ADVANTAGE PROCESSING ---
+        discounted_returns, advantages = compute_gae_targets(
+            rollout_rewards, rollout_values, last_values, gamma=config["GAMMA"]
+        )
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         
-        # --- 2. ADVANTAGE AND TARGET LABELS COMPUTATION ---
-        # Construct temporal difference returns (TD targets) using explicit GAE loops
-        returns = np.zeros_like(b_rewards)
-        last_gae = np.zeros(config["N_BOARDS_TRAIN"])
+        b_states = flatten_rollout(rollout_states)
+        b_actions = flatten_rollout(rollout_actions)
+        b_log_probs = flatten_rollout(rollout_log_probs)
+        b_returns = flatten_rollout(discounted_returns)
+        b_advantages = flatten_rollout(advantages)
         
-        for t in reversed(range(ROLLOUT_STEPS)):
-            next_v = next_values if t == ROLLOUT_STEPS - 1 else b_values[t + 1]
-            delta = b_rewards[t] + GAMMA * next_v - b_values[t]
-            # Standard GAE lambda value can be safely parameterized to 0.95
-            returns[t] = delta + b_values[t] # Simplified direct empirical value return mapping
-            
-        b_returns = returns.flatten()
-        b_advantages = b_returns - b_values.flatten()
-        # Normalize advantages across the rollout batch block to stabilize gradient descents
-        b_advantages = (b_advantages - np.mean(b_advantages)) / (np.std(b_advantages) + 1e-8)
+        # --- 3. THE OPTIMIZATION STEP CRADLE ---
+        dataset_size = b_states.shape[0]
         
-        # --- 3. GRADIENT OPTIMIZATION BACKPROPAGATION PHASE ---
-        for _ in range(PPO_EPOCHS):
-            with tf.GradientTape(persistent=True) as tape:
-                # Forward passes
-                new_probs = actor(b_states, training=True)
-                new_values = critic(b_states, training=True)[:, 0]
-                
-                # Fetch new log probabilities for the executed actions vector
-                one_hot_act = tf.one_hot(b_actions, depth=4)
-                chosen_probs = tf.reduce_sum(new_probs * one_hot_act, axis=1)
-                new_log_probs = tf.math.log(chosen_probs + 1e-10)
-                
-                # Compute probability ratios: r_t(theta) = pi(a|s) / pi_old(a|s)
-                ratios = tf.exp(new_log_probs - b_old_log_probs)
-                
-                # PPO Clipped Objective Function Calculation Math
-                surr1 = ratios * b_advantages
-                surr2 = tf.clip_by_value(ratios, 1.0 - CLIP_VAL, 1.0 + CLIP_VAL) * b_advantages
-                actor_loss = -tf.reduce_mean(tf.minimum(surr1, surr2))
-                
-                # Value Objective Function (Critic Mean Squared Error Loss)
-                critic_loss = tf.reduce_mean(tf.square(b_returns - new_values))
-                
-            # Apply gradients independently to maintain clean modular update lines
-            actor_grads = tape.gradient(actor_loss, actor.trainable_variables)
-            critic_grads = tape.gradient(critic_loss, critic.trainable_variables)
+        for epoch in range(config["PPO_EPOCHS"]):
+            indices = np.random.permutation(dataset_size)
             
-            actor_optimizer.apply_gradients(zip(actor_grads, actor.trainable_variables))
-            critic_optimizer.apply_gradients(zip(critic_grads, critic.trainable_variables))
-            del tape
-            
-        global_step = (itr + 1) * ROLLOUT_STEPS
-        if global_step % 1000 == 0 or itr == iterations - 1:
-            print(f"Global Step: {global_step:5d} | Mean Actor Loss: {float(actor_loss):.4f} | Mean Critic Loss: {float(critic_loss):.4f}")
-            
-    # --- 4. EXPORT PPO MODEL WEIGHTS ---
-    print("PPO Optimization Finished! Exporting Actor parameters...")
-    os.makedirs("models", exist_ok=True)
-    actor.save("models/ppo_snake_actor.keras")
-    print("Actor Policy model successfully exported to disk.")
+            for start in range(0, dataset_size, config["BATCH_SIZE"]):
+                # Stop updating immediately if we reach the overall timeline cap mid-epoch
+                if optimization_step >= total_optimization_targets:
+                    break
+                    
+                end = start + config["BATCH_SIZE"]
+                mb_idx = indices[start:end]
+                
+                # Fetch mini-batch slices
+                mb_states = b_states[mb_idx]
+                mb_actions = b_actions[mb_idx]
+                mb_old_log_probs = b_log_probs[mb_idx]
+                mb_advantages = b_advantages[mb_idx]
+                mb_returns = b_returns[mb_idx]
+                
+                # Execute gradient step tapes
+                with tf.GradientTape() as actor_tape:
+                    new_probs = actor(mb_states, training=True)
+                    new_log_probs = compute_tf_log_probabilities(new_probs, mb_actions)
+                    ratios = tf.exp(new_log_probs - mb_old_log_probs)
+                    surr1 = ratios * mb_advantages
+                    surr2 = tf.clip_by_value(ratios, 1.0 - config["CLIP_EPSILON"], 1.0 + config["CLIP_EPSILON"]) * mb_advantages
+                    entropy = -tf.reduce_mean(tf.reduce_sum(new_probs * tf.math.log(new_probs + 1e-8), axis=1))
+                    actor_loss = -tf.reduce_mean(tf.minimum(surr1, surr2)) - (0.02 * entropy)
+                    
+                with tf.GradientTape() as critic_tape:
+                    new_values = critic(mb_states, training=True)[:, 0]
+                    huber = tf.keras.losses.Huber(delta=1.0)
+                    critic_loss = huber(mb_returns, new_values)
+                    
+                # Apply changes to your weights
+                actor_grads = actor_tape.gradient(actor_loss, actor.trainable_variables)
+                actor_optimizer.apply_gradients(zip(actor_grads, actor.trainable_variables))
+                
+                critic_grads = critic_tape.gradient(critic_loss, critic.trainable_variables)
+                critic_optimizer.apply_gradients(zip(critic_grads, critic.trainable_variables))
+                
+                # Increment the true optimization step counter
+                optimization_step += 1
+                
+    # Save network model and exit loop...
+    if full:
+        actor.save("models/ppo_actor_snake.keras")
+    else:
+        actor.save("models/ppo_actor_snake_partial.keras")
+    return pd.DataFrame(eval_history)
